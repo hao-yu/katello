@@ -9,6 +9,12 @@ module ::Actions::Katello::ContentView
     before(:all) do
       set_user
     end
+
+    # Dynflow's action testing helpers do not execute execution-plan hooks.
+    def run_success_hooks
+      execution_plan = stub('execution plan', logger: Rails.logger)
+      action_class.execution_plan_hooks.run(execution_plan, action, :success)
+    end
   end
 
   class CreateTest < TestBase
@@ -262,6 +268,33 @@ module ::Actions::Katello::ContentView
       assert_equal run.input[:content_view_version_id], run.output[:auto_publish_content_view_version_id]
       assert_equal [1, 2, 3], run.output[:auto_publish_content_view_ids]
     end
+
+    context 'successful execution' do
+      before do
+        action.stubs(:task).returns(success_task)
+        action.stubs(:emit_event_success)
+        SmartProxy.stubs(:sync_needed?).returns(false)
+      end
+
+      it 'queues a host status refresh after publishing' do
+        plan_action(action, content_view)
+
+        ForemanTasks.expects(:async_task).with(
+          ::Actions::Katello::ContentView::UpdateHostStatus,
+          content_view, content_view.organization.library
+        ).once
+
+        run_success_hooks
+      end
+
+      it 'skips the host status refresh when promotion is skipped' do
+        plan_action(action, content_view, '', skip_promotion: true)
+
+        ForemanTasks.expects(:async_task).never
+
+        run_success_hooks
+      end
+    end
   end
 
   class RefreshRollingRepoTest < TestBase
@@ -499,6 +532,22 @@ module ::Actions::Katello::ContentView
     end
   end
 
+  class UpdateHostStatusTest < TestBase
+    let(:action_class) { ::Actions::Katello::ContentView::UpdateHostStatus }
+
+    it 'refreshes errata counts and status for subscribed hosts' do
+      facet = katello_content_facets(:content_facet_two)
+      cvenv = facet.content_view_environments.first
+
+      plan_action(action, cvenv.content_view, cvenv.lifecycle_environment)
+
+      ::Katello::Host::ContentFacet.any_instance.expects(:update_applicability_counts).once
+      ::Katello::Host::ContentFacet.any_instance.expects(:update_errata_status).once
+
+      run_action action
+    end
+  end
+
   class PromoteToEnvironmentTest < TestBase
     let(:action_class) { ::Actions::Katello::ContentView::PromoteToEnvironment }
 
@@ -528,6 +577,26 @@ module ::Actions::Katello::ContentView
 
       refute_empty content_view_version.history
       assert_action_planned(action, Actions::Katello::ContentView::CapsuleSync)
+    end
+
+    context 'successful execution' do
+      before do
+        action.stubs(:task).returns(success_task)
+        action.stubs(:sync_proxies?).returns(false)
+      end
+
+      [['regular', false], ['incremental', true]].each do |kind, incremental_update|
+        it "queues a host status refresh after #{kind} promotion" do
+          plan_action(action, content_view_version, environment, 'description', incremental_update)
+
+          ForemanTasks.expects(:async_task).with(
+            ::Actions::Katello::ContentView::UpdateHostStatus,
+            content_view_version.content_view, environment
+          ).once
+
+          run_success_hooks
+        end
+      end
     end
   end
 
